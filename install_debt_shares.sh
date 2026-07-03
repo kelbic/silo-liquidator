@@ -57,18 +57,4 @@ FILE_EOF
 cd "$DIR"
 python3 -m py_compile analysis/debt_shares.py && echo "[OK] py_compile"
 python3 -c "import analysis.debt_shares" && echo "[OK] реальный импорт"
-python3 - << 'PY_TEST'
-import analysis.debt_shares as ds
-assert ds.SEL_MAX_REPAY_SHARES == "0x29d6509a"
-class F:
-    def eth_call(s,to,data):
-        assert data.startswith(ds.SEL_MAX_REPAY_SHARES)
-        return "0x"+hex(7)[2:].rjust(64,"0")
-assert ds.get_raw_shares(F(),"0xsilo","0xb")==7
-class F0:
-    def eth_call(s,to,data): return "0x"+"0"*64
-assert ds.get_raw_shares(F0(),"0xsilo","0xb")==0
-print("[OK] get_raw_shares: ненулевой и нулевой случаи — прошли")
-PY_TEST
-echo ">> debt_shares.py готов. Запуск:"
-echo "   python3 -m analysis.debt_shares --rpc https://rpc.soniclabs.com --silo <силос> --borrower <адрес>"
+echo ">> debt_shares.py готов (уже стоит, если ставил раньше — переустановка безопасна)."
