@@ -238,8 +238,15 @@ def main():
     silo = a.silo.lower()
     mkt = resolve_market(rpc, silo)
     dec, cdec = mkt["debt_decimals"], mkt["coll_decimals"]
-    aggregator = a.aggregator or resolve_aggregator(rpc, mkt["collateral_silo"])
-    sys.stderr.write(f"S/USD агрегатор (живой резолв): {aggregator}\n")
+    aggregator = a.aggregator
+    if not aggregator:
+        try:
+            aggregator = resolve_aggregator(rpc, mkt["collateral_silo"])
+        except (RpcError, RuntimeError) as ex:
+            aggregator = None  # НЕ фатально: критерий (C) пропустим, (B) lag оракула не требует
+            sys.stderr.write(f"⚠ агрегатор не резолвится ({str(ex)[:60]}) — считаю только (B) lag, без модели (C)\n")
+    if aggregator:
+        sys.stderr.write(f"агрегатор цены (живой резолв): {aggregator}\n")
 
     tip = rpc.block_number()
     frm = find_block_at_ts(rpc, rpc.block_ts(tip) - int(a.days * 86400), tip)
@@ -281,16 +288,17 @@ def main():
         covered = any(x < E for x in borrow_blocks.get(b, [])) or any(x < E for x in liq_blocks_hist.get(b, []))
         # модель (C) per-event: каждое событие каскада — по цене оракула СВОЕГО блока.
         # v1 (вся сумма по цене первого блока) считается рядом на каскадах — видно артефакт агрегации.
-        try:
-            model = model_check_events(ep["events"], lambda blk: oracle_price_e8(rpc, aggregator, blk),
-                                       mkt["liq_fee_wei"], dec, cdec)
-            model_v1 = None
-            if ep["n_events"] > 1:
-                model_v1 = model_check(ep["repay_raw_total"], ep["withdraw_raw_total"],
-                                       oracle_price_e8(rpc, aggregator, L), mkt["liq_fee_wei"], dec, cdec)
-        except (RpcError, RuntimeError) as ex:
-            sys.stderr.write(f"  {b[:12]}… оракул@{L}: {str(ex)[:80]} — без модели\n")
-            model, model_v1 = None, None
+        model, model_v1 = None, None
+        if aggregator is not None:
+            try:
+                model = model_check_events(ep["events"], lambda blk: oracle_price_e8(rpc, aggregator, blk),
+                                           mkt["liq_fee_wei"], dec, cdec)
+                if ep["n_events"] > 1:
+                    model_v1 = model_check(ep["repay_raw_total"], ep["withdraw_raw_total"],
+                                           oracle_price_e8(rpc, aggregator, L), mkt["liq_fee_wei"], dec, cdec)
+            except (RpcError, RuntimeError) as ex:
+                sys.stderr.write(f"  {b[:12]}… оракул@{L}: {str(ex)[:80]} — без модели\n")
+                model, model_v1 = None, None
         # предсказание maxLiquidation на L-1 vs факт первого события (что видел бы детектор)
         try:
             _, pred_repay, _ = get_max_liquidation_at(rpc, mkt["hook"], b, L - 1)
