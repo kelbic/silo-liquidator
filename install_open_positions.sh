@@ -6,7 +6,9 @@ DIR="${SILO_DIR:-/root/silo-liquidator}"
 [ -f "$DIR/analysis/contestation.py" ] || { echo "СТОП: нет contestation.py"; exit 1; }
 grep -q "topic0" "$DIR/analysis/contestation.py" || { echo "СТОП: contestation.py без параметра topic0 — прогони update_contestation.sh сначала"; exit 1; }
 [ -f "$DIR/analysis/borrower_health.py" ] || { echo "СТОП: нет borrower_health.py"; exit 1; }
-grep -q "SEL_DEBT_BAL" "$DIR/analysis/borrower_health.py" || { echo "СТОП: borrower_health.py без SEL_DEBT_BAL — обнови его сначала"; exit 1; }
+grep -q "SEL_DEBT_BAL" "$DIR/analysis/borrower_health.py" || { echo "СТОП: borrower_health.py без SEL_DEBT_BAL"; exit 1; }
+[ -f "$DIR/analysis/debt_shares.py" ] || { echo "СТОП: нет debt_shares.py"; exit 1; }
+grep -q "get_raw_shares" "$DIR/analysis/debt_shares.py" || { echo "СТОП: debt_shares.py без get_raw_shares"; exit 1; }
 cat > "$DIR/analysis/open_positions.py" << 'FILE_EOF'
 #!/usr/bin/env python3
 """open_positions.py — enumerate ТЕКУЩИХ заёмщиков с открытым долгом на силосе. (read-only)
@@ -30,6 +32,7 @@ import argparse
 
 from analysis.contestation import RPC, fetch_liquidation_logs, decode_liquidation_log, find_block_at_ts, silo_token_meta
 from analysis.borrower_health import SILO_LENS_SONIC, SEL_DEBT_BAL, _addr_pad, get_borrower_health
+from analysis.debt_shares import get_raw_shares
 
 TOPIC0_BORROW = "0x96558a334f4759f0e7c423d68c84721860bd8fbf94ddc4e55158ecb125ad04b5"  # keccak-сверен
 
@@ -91,14 +94,20 @@ def main():
     rows.sort(key=lambda r: r[1]["lt_pct"] - r[1]["ltv_pct"])  # ближе к LT — первым
 
     print(f"{'заёмщик':44s} {'LTV':>8s} {'LT':>8s} {'запас п.п.':>11s}  {'долг '+m_debt['symbol']:>14s}  статус")
+    DUST_THRESHOLD_RAW = 1_000_000  # $1 в raw-единицах USDC (decimals=6) — консервативный порог:
+    # на несколько порядков выше шума округления conversion (доли цента), с запасом ниже газовых
+    # издержек Sonic. Порог, не точный ==0: debt_raw на границе 1 wei долей МОЖЕТ давать 0 или 1-2
+    # raw-единицы от блока к блоку (сдвиг totalSiloAssets/totalShares из-за начисления процентов) —
+    # точное сравнение с нулём НЕНАДЁЖНО на этой границе, порог — устойчив.
     for addr, h in rows:
         margin = h["lt_pct"] - h["ltv_pct"]
         debt_amt = h["debt_raw"] / (10 ** m_debt["decimals"])
-        if h["debt_raw"] == 0:
-            # per getDebtSilo() в SiloConfig.sol: debt может быть только на ОДНОЙ стороне пары
-            # (require debtBal0==0 || debtBal1==0). Если maxRepay на НАШЕМ силосе==0, а LTV/LT
-            # всё равно ненулевые — реальный долг заёмщика на ДРУГОЙ стороне пары, не наш случай.
-            status = "НЕ НАШ СИЛОС (долг вероятно на другой стороне пары — не для этого отчёта)"
+        if h["debt_raw"] < DUST_THRESHOLD_RAW:
+            raw_shares = get_raw_shares(rpc, silo, addr)
+            if raw_shares > 0:
+                status = f"ПЫЛЬ (${debt_amt:.6f}, {raw_shares} сырых долей — не captureable)"
+            else:
+                status = "НЕТ ПОЗИЦИИ НА ЭТОМ СИЛОСЕ (0 и в долях, и в активах)"
         elif h["ltv"] == 0 and h["lt"] == 0:
             status = "НЕСОГЛАСОВАНО (debt>0, LTV=LT=0 — не доверять)"
         else:
@@ -122,6 +131,12 @@ class F:
         s.calls.append((to,data)); return "0x"+hex(5000_000000)[2:].rjust(64,"0")
 f=F(); assert op.get_debt_only(f,"0xsilo","0xb")==5000_000000 and len(f.calls)==1
 print("[OK] decode_borrow_owner + get_debt_only — прошли")
+DUST_THRESHOLD_RAW = 1_000_000
+for flicker in [0,1,2,999_999]:
+    assert flicker < DUST_THRESHOLD_RAW
+assert not (7520_000000 < DUST_THRESHOLD_RAW)
+assert not (1_000_000 < DUST_THRESHOLD_RAW)
+print("[OK] порог устойчив к flicker-багу (0-2 raw), не режет реальные позиции — прошли")
 PY_TEST
-echo ">> open_positions.py v4 (+статус 'НЕ НАШ СИЛОС' — исключает ложный ЛИКВИДИРУЕМ при debt_raw==0). Запуск:"
+echo ">> open_positions.py v6 (порог \$1 вместо точного ==0 — устойчиво к flicker округления). Запуск:"
 echo "   python3 -m analysis.open_positions --rpc https://rpc.soniclabs.com --silo 0x322e1d5384aa4ed66aeca770b95686271de61dc3 --days 30"

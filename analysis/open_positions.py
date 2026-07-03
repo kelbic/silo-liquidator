@@ -20,6 +20,7 @@ import argparse
 
 from analysis.contestation import RPC, fetch_liquidation_logs, decode_liquidation_log, find_block_at_ts, silo_token_meta
 from analysis.borrower_health import SILO_LENS_SONIC, SEL_DEBT_BAL, _addr_pad, get_borrower_health
+from analysis.debt_shares import get_raw_shares
 
 TOPIC0_BORROW = "0x96558a334f4759f0e7c423d68c84721860bd8fbf94ddc4e55158ecb125ad04b5"  # keccak-сверен
 
@@ -81,14 +82,20 @@ def main():
     rows.sort(key=lambda r: r[1]["lt_pct"] - r[1]["ltv_pct"])  # ближе к LT — первым
 
     print(f"{'заёмщик':44s} {'LTV':>8s} {'LT':>8s} {'запас п.п.':>11s}  {'долг '+m_debt['symbol']:>14s}  статус")
+    DUST_THRESHOLD_RAW = 1_000_000  # $1 в raw-единицах USDC (decimals=6) — консервативный порог:
+    # на несколько порядков выше шума округления conversion (доли цента), с запасом ниже газовых
+    # издержек Sonic. Порог, не точный ==0: debt_raw на границе 1 wei долей МОЖЕТ давать 0 или 1-2
+    # raw-единицы от блока к блоку (сдвиг totalSiloAssets/totalShares из-за начисления процентов) —
+    # точное сравнение с нулём НЕНАДЁЖНО на этой границе, порог — устойчив.
     for addr, h in rows:
         margin = h["lt_pct"] - h["ltv_pct"]
         debt_amt = h["debt_raw"] / (10 ** m_debt["decimals"])
-        if h["debt_raw"] == 0:
-            # per getDebtSilo() в SiloConfig.sol: debt может быть только на ОДНОЙ стороне пары
-            # (require debtBal0==0 || debtBal1==0). Если maxRepay на НАШЕМ силосе==0, а LTV/LT
-            # всё равно ненулевые — реальный долг заёмщика на ДРУГОЙ стороне пары, не наш случай.
-            status = "НЕ НАШ СИЛОС (долг вероятно на другой стороне пары — не для этого отчёта)"
+        if h["debt_raw"] < DUST_THRESHOLD_RAW:
+            raw_shares = get_raw_shares(rpc, silo, addr)
+            if raw_shares > 0:
+                status = f"ПЫЛЬ (${debt_amt:.6f}, {raw_shares} сырых долей — не captureable)"
+            else:
+                status = "НЕТ ПОЗИЦИИ НА ЭТОМ СИЛОСЕ (0 и в долях, и в активах)"
         elif h["ltv"] == 0 and h["lt"] == 0:
             status = "НЕСОГЛАСОВАНО (debt>0, LTV=LT=0 — не доверять)"
         else:
