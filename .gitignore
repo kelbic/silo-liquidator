@@ -8,3 +8,4 @@ contracts/
 state_*.json
 radar/radar.env
 radar/radar.env
+paper_ledger_*.jsonl
