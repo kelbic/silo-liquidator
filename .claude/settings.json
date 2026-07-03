@@ -1,0 +1,12 @@
+{
+  "permissions": {
+    "deny": [
+      "Read(./.env)",
+      "Read(./.env.*)",
+      "Read(./**/*.key)",
+      "Read(./**/*.pem)",
+      "Bash(sudo:*)",
+      "Bash(systemctl:*)"
+    ]
+  }
+}
