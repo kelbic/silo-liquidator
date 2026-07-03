@@ -63,12 +63,14 @@ def cluster_episodes(events: list[dict]) -> list[dict]:
                 cur = {"borrower": b, "first_block": e["block"], "last_block": e["block"],
                        "first_liquidator": e["liquidator"], "n_events": 1,
                        "repay_raw_total": e["repay_raw"], "withdraw_raw_total": e["withdraw_raw"],
-                       "repay_raw_first": e["repay_raw"], "withdraw_raw_first": e["withdraw_raw"]}
+                       "repay_raw_first": e["repay_raw"], "withdraw_raw_first": e["withdraw_raw"],
+                       "events": [(e["block"], e["repay_raw"], e["withdraw_raw"])]}
             else:
                 cur["last_block"] = e["block"]
                 cur["n_events"] += 1
                 cur["repay_raw_total"] += e["repay_raw"]
                 cur["withdraw_raw_total"] += e["withdraw_raw"]
+                cur["events"].append((e["block"], e["repay_raw"], e["withdraw_raw"]))
         if cur:
             episodes.append(cur)
     episodes.sort(key=lambda x: x["first_block"])
@@ -127,6 +129,35 @@ def model_check(repay_raw: int, withdraw_raw: int, price_e8: int, liq_fee_wei: i
     ratio = realized_gross / predicted_gross if predicted_gross > 0 else float("nan")
     return {"repay_usd": repay_usd, "seized_usd": seized_usd,
             "realized_gross_usd": realized_gross, "predicted_gross_usd": predicted_gross, "ratio": ratio}
+
+
+def model_check_events(events: list[tuple[int, int, int]], price_at, liq_fee_wei: int,
+                       debt_decimals: int, coll_decimals: int) -> dict:
+    """Калибровка (C) PER-EVENT: каждое событие каскада оценивается ценой оракула СВОЕГО блока
+    (v1 ценила весь эпизод ценой первого блока — на падающих каскадах это завышало seized и ratio).
+    price_at(block)->int(e8) — инъецируемый колбэк (RPC или синтетика в тестах); кэш по блоку —
+    события одного блока не дёргают цену дважды.
+
+    Возврат в форме model_check + n_price_calls (контроль RPC-бюджета)."""
+    cache: dict[int, int] = {}
+
+    def price(b: int) -> int:
+        if b not in cache:
+            cache[b] = price_at(b)
+        return cache[b]
+
+    repay_usd = seized_usd = 0.0
+    repay_raw_total = 0
+    for block, repay_raw, withdraw_raw in events:
+        repay_usd += repay_raw / 10 ** debt_decimals
+        seized_usd += withdraw_raw / 10 ** coll_decimals * price(block) / 1e8
+        repay_raw_total += repay_raw
+    realized_gross = seized_usd - repay_usd
+    predicted_gross = gross_premium_debt(repay_raw_total, liq_fee_wei) / 10 ** debt_decimals
+    ratio = realized_gross / predicted_gross if predicted_gross > 0 else float("nan")
+    return {"repay_usd": repay_usd, "seized_usd": seized_usd,
+            "realized_gross_usd": realized_gross, "predicted_gross_usd": predicted_gross,
+            "ratio": ratio, "n_price_calls": len(cache)}
 
 
 def summarize(rows: list[dict]) -> dict:
@@ -248,14 +279,18 @@ def main():
         E = wb["first_insolvent"]
         # покрытие: любое НАШЕ событие заёмщика (Borrow или предыдущая ликвидация) строго до E
         covered = any(x < E for x in borrow_blocks.get(b, [])) or any(x < E for x in liq_blocks_hist.get(b, []))
-        # модель (C): цена оракула в блоке ликвидации; gross по СУММЕ эпизода (каскад = одна возможность)
+        # модель (C) per-event: каждое событие каскада — по цене оракула СВОЕГО блока.
+        # v1 (вся сумма по цене первого блока) считается рядом на каскадах — видно артефакт агрегации.
         try:
-            price = oracle_price_e8(rpc, aggregator, L)
-            model = model_check(ep["repay_raw_total"], ep["withdraw_raw_total"], price,
-                                mkt["liq_fee_wei"], dec, cdec)
+            model = model_check_events(ep["events"], lambda blk: oracle_price_e8(rpc, aggregator, blk),
+                                       mkt["liq_fee_wei"], dec, cdec)
+            model_v1 = None
+            if ep["n_events"] > 1:
+                model_v1 = model_check(ep["repay_raw_total"], ep["withdraw_raw_total"],
+                                       oracle_price_e8(rpc, aggregator, L), mkt["liq_fee_wei"], dec, cdec)
         except (RpcError, RuntimeError) as ex:
             sys.stderr.write(f"  {b[:12]}… оракул@{L}: {str(ex)[:80]} — без модели\n")
-            price, model = None, None
+            model, model_v1 = None, None
         # предсказание maxLiquidation на L-1 vs факт первого события (что видел бы детектор)
         try:
             _, pred_repay, _ = get_max_liquidation_at(rpc, mkt["hook"], b, L - 1)
@@ -269,6 +304,8 @@ def main():
         lagtxt = "SAME-BLOCK (block-polling не бьёт)" if wb["same_block"] else \
                  f"lag={wb['lag']}{'+ (обрезан)' if wb['truncated'] else ''} блоков"
         mtxt = f"gross реализ/предсказ={model['ratio']:.2f}" if model else "модель: н/д"
+        if model and model_v1:
+            mtxt += f" (v1-однаяцена={model_v1['ratio']:.2f}, цен запрошено {model['n_price_calls']})"
         ptxt = (f"maxLiq@L-1={pred_repay/10**dec:,.0f} vs факт={ep['repay_raw_first']/10**dec:,.0f}"
                 if pred_repay is not None else "maxLiq: н/д")
         sys.stderr.write(f"  {b}  L={L}  {lagtxt}  охвачен={'ДА' if covered else 'НЕТ'}  "

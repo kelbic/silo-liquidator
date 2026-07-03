@@ -4,7 +4,9 @@
 
 Запуск:  python3 -m analysis.test_backtest_detection
 """
-from analysis.backtest_detection import cluster_episodes, walk_back_insolvency, model_check, summarize
+from analysis.backtest_detection import (
+    cluster_episodes, walk_back_insolvency, model_check, model_check_events, summarize,
+)
 
 USDC = 10 ** 6
 WS = 10 ** 18
@@ -82,6 +84,49 @@ def test_model_check_math():
     # цена S=$0.50 при том же withdraw → seized $532.5, gross -$467.5 → ratio отрицательный
     m2 = model_check(1000 * USDC, 1065 * WS, int(0.50e8), FEE, 6, 18)
     assert m2["ratio"] < 0, m2
+
+
+def test_model_events_falling_cascade():
+    """Ядро уточнения (C): падающий каскад. Каждое событие честно даёт 6.5% gross ПО ЦЕНЕ СВОЕГО
+    блока; v1 (вся сумма по цене первого блока) на тех же данных ЗАВЫШАЕТ ratio — воспроизводим
+    артефакт, который видели на ките (1.11–1.39), и доказываем, что per-event его убирает."""
+    prices = {100: int(1.00e8), 110: int(0.50e8), 120: int(0.25e8)}  # S падает 1.00 → 0.25
+    events = []
+    for blk in (100, 110, 120):
+        repay = 1000 * USDC
+        # изъято ровно repay×1.065 ПО ЦЕНЕ ЭТОГО блока (цены выбраны с целым делением: 1065/0.5=2130,
+        # 1065/0.25=4260 — без округления фикстуры) — идеальное исполнение протокола
+        withdraw = int(1065 * WS * int(1e8)) // prices[blk]
+        events.append((blk, repay, withdraw))
+
+    m = model_check_events(events, lambda b: prices[b], FEE, 6, 18)
+    assert abs(m["ratio"] - 1.0) < 1e-6, m  # per-event: точно 1.0
+    assert m["n_price_calls"] == 3
+
+    # v1 на тех же данных: вся сумма withdraw по цене ПЕРВОГО блока (1.00) — сильное завышение
+    total_repay = sum(e[1] for e in events)
+    total_withdraw = sum(e[2] for e in events)
+    v1 = model_check(total_repay, total_withdraw, prices[100], FEE, 6, 18)
+    assert v1["ratio"] > 2.0, v1  # артефакт воспроизведён: кратное завышение на падающем каскаде
+
+
+def test_model_events_price_cache():
+    # события одного блока не дёргают цену дважды
+    calls = []
+    def price_at(b):
+        calls.append(b)
+        return int(1.00e8)
+    events = [(100, 1000 * USDC, 1065 * WS), (100, 500 * USDC, 532 * WS), (110, 100 * USDC, 107 * WS)]
+    m = model_check_events(events, price_at, FEE, 6, 18)
+    assert m["n_price_calls"] == 2 and len(calls) == 2, (m, calls)
+
+
+def test_model_events_single_matches_v1():
+    # на одиночном событии per-event и v1 обязаны совпасть (одна цена, одни суммы)
+    ev = [(100, 1000 * USDC, 1065 * WS)]
+    m = model_check_events(ev, lambda b: int(1.00e8), FEE, 6, 18)
+    v1 = model_check(1000 * USDC, 1065 * WS, int(1.00e8), FEE, 6, 18)
+    assert abs(m["ratio"] - v1["ratio"]) < 1e-9
 
 
 def test_summarize_criteria():
