@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+*.db
+*.log
+.DS_Store
+contracts/
+*.tar.gz
+state_*.json
+radar/radar.env
+radar/radar.env

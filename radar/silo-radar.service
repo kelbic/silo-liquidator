@@ -1,0 +1,12 @@
+[Unit]
+Description=Silo liquidation-market radar (young lending markets)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/root/silo-liquidator/radar
+EnvironmentFile=/root/silo-liquidator/radar/radar.env
+ExecStart=/usr/bin/nice -n 19 /usr/bin/python3 /root/silo-liquidator/radar/radar.py
+CPUQuota=20%
+MemoryMax=256M
